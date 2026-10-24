@@ -8,6 +8,7 @@ import select
 import socket
 import subprocess
 import sys
+import time
 from urllib.parse import quote
 
 from helpers import (
@@ -19,8 +20,12 @@ from helpers import (
     get_dec,
     get_enc,
     get_key,
+    get_local_ip,
     get_nonce,
 )
+
+PUNCH_TIMEOUT = 8
+PUNCH_INTERVAL = 0.25
 
 
 def main(serial, dtype=0, username=None, password=None, debug=False):
@@ -59,7 +64,8 @@ def main(serial, dtype=0, username=None, password=None, debug=False):
 
     device_remote = UDP(MAIN_SERVER, MAIN_PORT, debug)
 
-    laddr = f"127.0.0.1:{device_remote.lport}"
+    # advertise the real LAN address so a device on the same network can reach us
+    laddr = f"{get_local_ip(MAIN_SERVER)}:{device_remote.lport}"
     ipaddr = f"<IpEncrpt>true</IpEncrpt><LocalAddr>{laddr}</LocalAddr>"
     auth = ""
     aid = random.randbytes(8)
@@ -92,9 +98,13 @@ def main(serial, dtype=0, username=None, password=None, debug=False):
         "<body><Client>:0</Client></body>",
     )
 
-    res = device_remote.read(return_error=True)
-    if res["code"] < 200:
-        res = device_remote.read(return_error=True)
+    try:
+        res = device_remote.read(return_error=True, timeout=10)
+        while res["code"] < 200:
+            res = device_remote.read(return_error=True, timeout=10)
+    except socket.timeout:
+        print("Error: the device did not answer the p2p-channel request.")
+        sys.exit(1)
 
     if res["code"] >= 400:
         print("Error:", res["status"])
@@ -164,13 +174,34 @@ def main(serial, dtype=0, username=None, password=None, debug=False):
         + b"\xff\xfb\xff\xf7\xff\xfe"
         + eaddr
     )
-    print(f":{device_remote.lport} >>> {device_remote.rhost}:{device_remote.rport}")
-    print("".join(f"\\x{b:02X}" for b in data))
-    device_remote.send(data)
+    # keep probing: the first probes are usually dropped by our own NAT
+    # before the device has punched its side
+    deadline = time.monotonic() + PUNCH_TIMEOUT
+    request = data
+    data = None
+    while data is None and time.monotonic() < deadline:
+        print(f":{device_remote.lport} >>> {device_remote.rhost}:{device_remote.rport}")
+        print("".join(f"\\x{b:02X}" for b in request))
+        device_remote.send(request)
 
-    try:
-        data = device_remote.recv(timeout=5)
-    except socket.timeout:
+        ready, _, _ = select.select([device_remote], [], [], PUNCH_INTERVAL)
+        if not ready:
+            continue
+
+        try:
+            data, src = device_remote.recvfrom(65536)
+        except OSError:
+            data = None
+            continue
+
+        if src[0] != device_server or len(data) < 20:
+            data = None
+            continue
+
+        # the device NAT may have rewritten the port, follow the real source
+        device_remote.rhost, device_remote.rport = src
+
+    if data is None:
         print("Timeout occurred while waiting for a response from the device.")
         print("If the issue persists, you may need to use relay mode with this device.")
         print("Note: Relay mode is currently not implemented for Python.")

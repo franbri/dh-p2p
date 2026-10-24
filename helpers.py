@@ -26,6 +26,21 @@ IV = b"2z52*lk9o6HRyJrf"
 
 CSEQ = 0
 
+REQUEST_TIMEOUT = 1.5
+REQUEST_ATTEMPTS = 4
+
+
+def get_local_ip(remote_host, remote_port=MAIN_PORT):
+    """
+    LAN address used to reach the remote host (no packet is sent)
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((remote_host, remote_port))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
 
 def get_key(username, password):
     key = f"{username}:Login to {RANDSALT}:{password}"
@@ -175,19 +190,20 @@ class UDP(socket.socket):
     def send(self, data):
         self.sendto(data, (self.rhost, self.rport))
 
-    def recv(self, bufsize=4096, timeout=None):
+    def recv(self, bufsize=65536, timeout=None):
         if timeout:
             self.settimeout(timeout)
 
-        data = self.recvfrom(bufsize)[0]
-
-        if timeout:
-            self.settimeout(None)
+        try:
+            data = self.recvfrom(bufsize)[0]
+        finally:
+            if timeout:
+                self.settimeout(None)
 
         return data
 
-    def read(self, return_error=False):
-        data = self.recv().decode()
+    def read(self, return_error=False, timeout=None):
+        data = self.recv(timeout=timeout).decode(errors="replace")
 
         print(f":{self.lport} <<< {self.rhost}:{self.rport}")
         print(data.replace("\r\n", "\n"))
@@ -230,11 +246,25 @@ Content-Length: {len(body)}
         req += f"""
 {body}"""
 
-        print(f":{self.lport} >>> {self.rhost}:{self.rport}")
-        print(req)
-        self.send(req.replace("\n", "\r\n").encode())
+        if not should_read:
+            print(f":{self.lport} >>> {self.rhost}:{self.rport}")
+            print(req)
+            self.send(req.replace("\n", "\r\n").encode())
+            return None
 
-        return self.read() if should_read else None
+        # UDP datagrams get lost, retry with a growing timeout
+        for attempt in range(1, REQUEST_ATTEMPTS + 1):
+            print(f":{self.lport} >>> {self.rhost}:{self.rport}")
+            print(req)
+            self.send(req.replace("\n", "\r\n").encode())
+
+            try:
+                return self.read(timeout=REQUEST_TIMEOUT * attempt)
+            except socket.timeout:
+                print(f"No response to {path}, retrying ({attempt}/{REQUEST_ATTEMPTS})")
+
+        print(f"Error: no response from {self.rhost}:{self.rport} to {path}")
+        sys.exit(1)
 
     def read_ptcp(self):
         data = self.recv()

@@ -11,7 +11,11 @@ In my specific scenario, I have a KBVision CCTV system. Although I can access th
 ## Files
 
 - Rust implementation:
-  - `src/*.rs` - Rust source files
+  - `src/main.rs` - Command line and reconnection loop
+  - `src/dh.rs` - Signaling, hole punching and handshake
+  - `src/ptcp.rs` - PTCP protocol and session reliability
+  - `src/tunnel.rs` - TCP to PTCP forwarding
+  - `src/auth.rs` - Device authentication
   - `Cargo.toml` - Rust dependencies
 - Python implementation:
   - `main.py` - Main script
@@ -36,10 +40,49 @@ Arguments:
 
 Options:
   -p, --port <[bind_address:]port:remote_port>
-          Bind address, port and remote port. Default: 127.0.0.1:1554:554
+          Bind address, port and remote port [default: 127.0.0.1:1554:554]
+  -r, --relay
+          Always use relay mode (slower, but works behind any NAT)
+      --no-relay
+          Never fall back to relay mode when the direct connection fails
+  -u, --username <USERNAME>
+          Device username, for devices requiring authentication [env: DH_USERNAME=]
+      --password <PASSWORD>
+          Device password, for devices requiring authentication [env: DH_PASSWORD]
+      --punch-timeout <SECONDS>
+          Seconds to wait for the device during hole punching [default: 8]
+      --no-reconnect
+          Exit when the connection is lost instead of reconnecting
+  -v, --verbose
+          Print every packet
   -h, --help
           Print help
 ```
+
+Example:
+
+```bash
+cargo run --release -- -p 0.0.0.0:1554:554 <SERIAL>
+ffplay -rtsp_transport tcp -i "rtsp://<username>:<password>@127.0.0.1:1554/cam/realmonitor?channel=1&subtype=0"
+```
+
+For devices that answer `403` when the P2P channel is created, pass the device credentials (prefer the environment variables so the password does not show up in the process list):
+
+```bash
+DH_USERNAME=admin DH_PASSWORD=secret cargo run --release -- <SERIAL>
+```
+
+### Connectivity
+
+The Rust implementation tries hard to keep the tunnel up on unreliable networks:
+
+- **Signaling retries**: requests to the Easy4IPCloud servers are retransmitted with a growing timeout, so a single lost UDP datagram no longer hangs the handshake.
+- **Hole punching**: probes are repeated for `--punch-timeout` seconds, to both the public and the LAN address of the device, and the device's real source address is learned from its answer (port-rewriting NATs). The client advertises its real LAN address instead of `127.0.0.1`, so a device on the same network can be reached without hairpin NAT.
+- **Automatic relay fallback**: if the direct connection cannot be established, the tunnel falls back to relay mode (disable with `--no-relay`).
+- **Reliable PTCP**: lost packets are retransmitted, duplicates are dropped and reordered packets are delivered in order. This is only enabled once the device's counters have been observed to match ours, otherwise the original best-effort behavior is kept.
+- **Liveness and reconnection**: heartbeats are sent every 5 seconds, a device silent for 30 seconds is considered gone and the tunnel reconnects with exponential backoff. The local port stays open across reconnections.
+- **Smaller datagrams and larger buffers**: client data is split into chunks that fit common path MTUs (fragmented UDP is often dropped), and the UDP receive buffer is enlarged to absorb video bursts.
+- **No crashes on bad input**: malformed packets, unknown connections and refused connections are logged and ignored instead of panicking.
 
 ## Python implementation
 

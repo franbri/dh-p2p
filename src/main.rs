@@ -1,141 +1,202 @@
 use clap::Parser;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
-use tokio::{
-    net::{TcpListener, UdpSocket},
-    sync::{mpsc, oneshot},
-};
+use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
 
 use crate::{
-    dh::p2p_handshake,
-    process::{dh_reader, dh_writer, process_reader, process_writer},
-    ptcp::PTCPEvent,
+    dh::{DirectFailed, Fatal, Options, Tunnel},
+    util::{set_verbose, Result},
 };
 
+#[macro_use]
+mod util;
+mod auth;
 mod dh;
-mod process;
 mod ptcp;
+mod tunnel;
+
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A session that lived this long resets the reconnection backoff
+const STABLE_SESSION: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(about = "A PoC implementation of TCP tunneling over Dahua P2P protocol.", long_about = None)]
 struct Cli {
-    /// Bind address, port and remote port. Default: 127.0.0.1:1554:554
-    #[arg(short, long, value_name = "[bind_address:]port:remote_port")]
-    port: Option<String>,
-    /// Relay mode (experimental)
+    /// Bind address, port and remote port
+    #[arg(
+        short,
+        long,
+        value_name = "[bind_address:]port:remote_port",
+        default_value = "127.0.0.1:1554:554"
+    )]
+    port: String,
+    /// Always use relay mode (slower, but works behind any NAT)
     #[arg(short, long)]
     relay: bool,
+    /// Never fall back to relay mode when the direct connection fails
+    #[arg(long, conflicts_with = "relay")]
+    no_relay: bool,
+    /// Device username, for devices requiring authentication
+    #[arg(short, long, env = "DH_USERNAME", requires = "password")]
+    username: Option<String>,
+    /// Device password, for devices requiring authentication
+    #[arg(
+        long,
+        env = "DH_PASSWORD",
+        hide_env_values = true,
+        requires = "username"
+    )]
+    password: Option<String>,
+    /// Seconds to wait for the device during hole punching
+    #[arg(long, value_name = "SECONDS", default_value_t = 8)]
+    punch_timeout: u64,
+    /// Exit when the connection is lost instead of reconnecting
+    #[arg(long)]
+    no_reconnect: bool,
+    /// Print every packet
+    #[arg(short, long)]
+    verbose: bool,
     /// Serial number of the camera
     serial: String,
+}
+
+fn parse_port(spec: &str) -> Option<(String, u16, u16)> {
+    let parts: Vec<&str> = spec.rsplitn(3, ':').collect();
+
+    match parts.as_slice() {
+        [remote, port] => Some((
+            "127.0.0.1".to_string(),
+            port.parse().ok()?,
+            remote.parse().ok()?,
+        )),
+        [remote, port, addr] => Some((
+            addr.trim_matches(|c| c == '[' || c == ']').to_string(),
+            port.parse().ok()?,
+            remote.parse().ok()?,
+        )),
+        _ => None,
+    }
+}
+
+async fn establish(opts: &Options, relay: bool, no_relay: bool) -> Result<Tunnel> {
+    if relay {
+        return dh::connect(opts, true).await;
+    }
+
+    match dh::connect(opts, false).await {
+        Ok(tunnel) => Ok(tunnel),
+        Err(e) if !no_relay && e.is::<DirectFailed>() => {
+            warn!("Direct connection failed: {}", e);
+            info!("Falling back to relay mode");
+            dh::connect(opts, true).await
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[tokio::main]
 async fn main() {
     let args = Cli::parse();
+    set_verbose(args.verbose);
 
-    let serial = args.serial;
-    let port = args.port.unwrap_or("127.0.0.1:1554:554".to_string());
-
-    let parts: Vec<&str> = port.split(':').collect();
-    let (bind_address, bind_port, remote_port): (&str, u16, u16) = match parts.len() {
-        2 => (
-            "127.0.0.1",
-            parts[0].parse().unwrap(),
-            parts[1].parse().unwrap(),
-        ),
-        3 => (
-            parts[0],
-            parts[1].parse().unwrap(),
-            parts[2].parse().unwrap(),
-        ),
-        _ => panic!("Invalid port specification"),
+    let Some((bind_address, bind_port, remote_port)) = parse_port(&args.port) else {
+        eprintln!("Invalid port specification: {}", args.port);
+        std::process::exit(2);
     };
 
-    // Bind the listener to the address
-    let listener = TcpListener::bind(format!("{}:{}", bind_address, bind_port))
-        .await
-        .unwrap();
-
-    let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-
-    let (socket, session) = p2p_handshake(socket, serial, args.relay).await;
-
-    let (dh_tx, dh_rx) = mpsc::channel::<PTCPEvent>(128);
-    let session = Arc::new(Mutex::new(session));
-
-    let channels = Arc::new(Mutex::new(HashMap::<u32, mpsc::Sender<Vec<u8>>>::new()));
-    let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
-
-    println!("PTCP session established");
-
-    /*
-     * Clone the handles
-     */
-
-    let reader = Arc::new(socket);
-    let writer = reader.clone();
-
-    let session2 = session.clone();
-    let channels2 = channels.clone();
-    let conn_channels2 = conn_channels.clone();
-
-    let hb_tx = dh_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            hb_tx.send(PTCPEvent::Heartbeat).await.unwrap();
+    // Bind the listener first so a busy port is reported immediately
+    let listener = match TcpListener::bind((bind_address.as_str(), bind_port)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("Failed to listen on {}:{}: {}", bind_address, bind_port, e);
+            std::process::exit(1);
         }
-    });
+    };
 
-    tokio::spawn(async move {
-        dh_writer(session, writer, dh_rx, remote_port.into()).await;
-    });
+    let opts = Options {
+        serial: args.serial,
+        credentials: args.username.zip(args.password),
+        punch_timeout: Duration::from_secs(args.punch_timeout),
+    };
 
-    tokio::spawn(async move {
-        dh_reader(session2, reader, channels, conn_channels).await;
-    });
+    let mut backoff = Duration::from_secs(1);
+    let mut announced = false;
 
-    println!("Ready to connect!");
-    if remote_port == 554 {
-        println!(
-            "RTSP URL: rtsp://127.0.0.1{}/cam/realmonitor?channel=1&subtype=0",
-            if bind_port != 554 {
-                format!(":{}", bind_port)
-            } else {
-                String::new()
+    let run = async {
+        loop {
+            info!("Connecting to device {}", opts.serial);
+
+            match establish(&opts, args.relay, args.no_relay).await {
+                Ok(tunnel) => {
+                    let started = Instant::now();
+
+                    info!(
+                        "PTCP session established via {} ({})",
+                        if tunnel.relay { "relay" } else { "direct P2P" },
+                        tunnel.peer
+                    );
+
+                    if !announced {
+                        announced = true;
+                        println!("Ready to connect!");
+                        if remote_port == 554 {
+                            println!(
+                                "RTSP URL: rtsp://{}{}/cam/realmonitor?channel=1&subtype=0",
+                                bind_address,
+                                if bind_port != 554 {
+                                    format!(":{}", bind_port)
+                                } else {
+                                    String::new()
+                                }
+                            );
+                        }
+                    }
+
+                    let reason = tunnel::run(tunnel, &listener, remote_port).await;
+                    warn!("Connection to device lost: {}", reason);
+
+                    if started.elapsed() >= STABLE_SESSION {
+                        backoff = Duration::from_secs(1);
+                    }
+                }
+                Err(e) if e.is::<Fatal>() => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+                Err(e) => warn!("Connection failed: {}", e),
             }
-        );
+
+            if args.no_reconnect {
+                std::process::exit(1);
+            }
+
+            info!("Reconnecting in {}s", backoff.as_secs());
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    };
+
+    tokio::select! {
+        _ = run => {}
+        _ = tokio::signal::ctrl_c() => info!("Interrupted, exiting"),
     }
+}
 
-    loop {
-        // The second item contains the IP and port of the new connection.
-        let (client, addr) = listener.accept().await.unwrap();
-        println!("Accepted connection from {}", addr);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        // Create a channel for the client
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
-        let (conn_tx, conn_rx) = oneshot::channel::<bool>();
-        let dh_tx = dh_tx.clone();
-
-        let realm_id = rand::random::<u32>();
-
-        // Store the channel in the map
-        channels2.lock().unwrap().insert(realm_id, tx);
-        conn_channels2.lock().unwrap().insert(realm_id, conn_tx);
-
-        dh_tx.send(PTCPEvent::Connect(realm_id)).await.unwrap();
-        conn_rx.await.unwrap();
-
-        let (reader, writer) = client.into_split();
-
-        tokio::spawn(async move {
-            process_reader(reader, realm_id, dh_tx).await;
-        });
-
-        tokio::spawn(async move {
-            process_writer(writer, rx).await;
-        });
+    #[test]
+    fn port_spec() {
+        assert_eq!(
+            parse_port("1554:554"),
+            Some(("127.0.0.1".into(), 1554, 554))
+        );
+        assert_eq!(
+            parse_port("0.0.0.0:554:554"),
+            Some(("0.0.0.0".into(), 554, 554))
+        );
+        assert_eq!(parse_port("[::1]:80:8080"), Some(("::1".into(), 80, 8080)));
+        assert_eq!(parse_port("554"), None);
+        assert_eq!(parse_port("a:b"), None);
     }
 }
