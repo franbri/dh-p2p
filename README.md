@@ -23,6 +23,7 @@ In my specific scenario, I have a KBVision CCTV system. Although I can access th
   - `requirements.txt` - Python dependencies
 - Others:
   - `dh-p2p.lua` - Wireshark dissector for Dahua P2P protocol
+  - `contrib/` - systemd service and install script
 
 ## Rust implementation
 
@@ -83,6 +84,19 @@ The Rust implementation tries hard to keep the tunnel up on unreliable networks:
 - **Liveness and reconnection**: heartbeats are sent every 5 seconds, a device silent for 30 seconds is considered gone and the tunnel reconnects with exponential backoff. The local port stays open across reconnections.
 - **Smaller datagrams and larger buffers**: client data is split into chunks that fit common path MTUs (fragmented UDP is often dropped), and the UDP receive buffer is enlarged to absorb video bursts.
 - **No crashes on bad input**: malformed packets, unknown connections and refused connections are logged and ignored instead of panicking.
+
+### Running as a system service
+
+`contrib/` holds a systemd unit for a machine dedicated to running tunnels. Each camera / NVR gets its own instance and config file in `/etc/dh-p2p/`:
+
+```bash
+./contrib/install.sh                       # build, install binary, unit and sysctl
+sudoedit /etc/dh-p2p/camera.env            # set SERIAL, PORT, credentials
+sudo systemctl enable --now dh-p2p@camera
+journalctl -u dh-p2p@camera -f
+```
+
+For another device, copy `contrib/example.env` to `/etc/dh-p2p/<name>.env` (mode `600`) with a different local port and enable `dh-p2p@<name>`. The service runs as an unprivileged dynamic user that may only bind ports below 1024. Re-run `install.sh` after `git pull` to update; running tunnels are restarted.
 
 ## Python implementation
 
